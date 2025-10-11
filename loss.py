@@ -88,3 +88,131 @@ class SILoss:
         proj_loss /= (len(zs) * bsz)
 
         return denoising_loss, proj_loss
+
+class FlowMatchingWithProjectionLoss:
+    def __init__(
+        self,
+        encoders=[],
+        accelerator=None,
+    ):
+        self.encoders = encoders
+        self.accelerator = accelerator
+    
+    def __call__(self, model, x1, device, model_kwargs=None, zs=None):
+        """
+        Flow Matching loss with projection loss
+        
+        Args:
+            model: DiT model
+            x1: clean images (B, 3, 32, 32)
+            model_kwargs: dict with 'y' (class labels)
+            zs: list of encoder features
+        """
+        if model_kwargs is None:
+            model_kwargs = {}
+        
+        # Sample noise
+        x0 = torch.randn_like(x1)
+        
+        # Sample timestep uniformly from [0, 1]
+        t = torch.rand((x1.shape[0],), device=x1.device, dtype=x1.dtype)  # (B,)
+        t_expanded = t.view(-1, 1, 1, 1) # (B, 1, 1, 1) for broadcasting
+
+        # Linear interpolation: xt = t*x1 + (1-t)*x0
+        xt = t_expanded * x1 + (1 - t_expanded) * x0
+        ut = x1 - x0
+                
+        # Model prediction
+        return_features = (zs is not None and len(zs) > 0)
+        
+        y = torch.zeros(x1.size(0), dtype=torch.long, device=x1.device)
+        
+        if return_features:
+            model_output, zs_tilde = model(xt, t, y=y, return_features=True)
+        else:
+            model_output = model(xt, t, y=y, return_features=False)
+            zs_tilde = None
+        
+        flow_loss = mean_flat((model_output - ut) ** 2)
+        flow_loss = flow_loss.mean()
+
+        # Projection loss (REPA style)
+        proj_loss = 0.
+        if zs is not None and zs_tilde is not None and len(zs) > 0:
+            for z, z_tilde in zip(zs, zs_tilde):
+                z_tilde_norm = F.normalize(z_tilde, dim=-1)
+                z_norm = F.normalize(z, dim=-1)
+                proj_loss += mean_flat(-(z_norm * z_tilde_norm).sum(dim=-1))
+            proj_loss = proj_loss.mean() / len(zs) 
+                
+        return flow_loss, proj_loss
+
+
+
+class IndependentFlowMatchingWithProjectionLoss:
+    def __init__(
+        self,
+        encoders=[],
+        accelerator=None,
+    ):
+        self.encoders = encoders
+        self.accelerator = accelerator
+    
+    def __call__(self, model, x1, y, device, model_kwargs=None, zs=None):
+        """
+        Flow Matching loss with projection loss
+        
+        Args:
+            model: DiT model
+            x1: clean images (B, 3, 32, 32)
+            model_kwargs: dict with 'y' (class labels)
+            zs: list of encoder features
+        """
+        if model_kwargs is None:
+            model_kwargs = {}
+        
+        # Sample noise
+        x0 = torch.randn_like(x1)
+        
+        # Sample timestep uniformly from [0, 1]
+        t1 = torch.rand((x1.shape[0],), device=x1.device, dtype=x1.dtype)  # (B,)
+        t2 = torch.rand((x1.shape[0],), device=x1.device, dtype=x1.dtype) 
+        t1_expanded = t1.view(-1, 1, 1, 1) # (B, 1, 1, 1) for broadcasting
+        t2_expanded = t2.view(-1, 1, 1, 1)  
+
+        y_embedded = model.module.label_embedder(y)
+        noise_y = torch.randn(x1.size(0), 384, device=device)
+        y_embedded_t = [t2_expanded * y_embedded + (1 - t2_expanded) * noise_y]
+
+        # Linear interpolation: xt = t*x1 + (1-t)*x0
+        xt = t1_expanded * x1 + (1 - t1_expanded) * x0
+        ut = x1 - x0
+                
+        # Model prediction
+        return_features = (zs is not None and len(zs) > 0)
+        
+        y = torch.zeros(x1.size(0), dtype=torch.long, device=x1.device)
+        
+        if return_features:
+            model_output, model_output_y ,zs_tilde = model(xt, t1,t2, y=y, noise_vector=y_embedded_t)
+        else:
+            raise NotImplementedError("IndependentFlowMatchingWithProjectionLoss requires return_features=True")
+
+        
+        
+        flow_loss = mean_flat((model_output - ut) ** 2)
+        flow_loss = flow_loss.mean()
+
+        # Projection loss (REPA style)
+        proj_loss = 0.
+        if zs is not None and zs_tilde is not None and len(zs) > 0:
+            for z, z_tilde in zip(zs, zs_tilde):
+                z_tilde_norm = F.normalize(z_tilde, dim=-1)
+                z_norm = F.normalize(z, dim=-1)
+                proj_loss += mean_flat(-(z_norm * z_tilde_norm).sum(dim=-1))
+            proj_loss = proj_loss.mean() / len(zs) 
+        
+        loss_y = torch.mean((model_output_y - (y_embedded - noise_y))**2)
+        
+        return flow_loss, proj_loss, loss_y
+

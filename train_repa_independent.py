@@ -19,9 +19,9 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 
-from models.sit import SiT_models
 from models.dit import DiT_models
-from loss import SILoss, FlowMatchingWithProjectionLoss
+from models.dit_repa_independent import DiTZeroflowintegrated_independent_t
+from loss import SILoss, IndependentFlowMatchingWithProjectionLoss
 from utils import load_encoders
 
 from dataset import CustomDataset
@@ -177,6 +177,21 @@ def generate_samples_euler(model, parallel, savedir, step, device, num_steps=100
     model.train()
     return samples
 
+
+def load_prototypes(prototype_path, device):
+    if not os.path.exists(prototype_path):
+        raise FileNotFoundError(
+            f"Prototype file not found at {prototype_path}. "
+            f"Please run compute_prototypes.py first to generate prototypes."
+        )
+    
+    print(f"Loading prototypes from {prototype_path}...")
+    checkpoint = torch.load(prototype_path, map_location=device)
+    prototypes = checkpoint['prototypes'].to(device)
+    
+    return prototypes
+
+
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
@@ -238,12 +253,13 @@ def main(args):
     #     encoder_depth=args.encoder_depth,
     #     **block_kwargs
     # )
-    model = DiT_models['DiT-S/2'](
+    original_model = DiT_models['DiT-S/2'](
         input_size=32,
         num_classes=10,
         in_channels=3,
         learn_sigma=False,
     ).to(device)
+    model = DiTZeroflowintegrated_independent_t(original_model, noise_dim=384, output_noise_dim=384).to(device)
 
     model = model.to(device)
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
@@ -267,13 +283,13 @@ def main(args):
         weighting=args.weighting
     )
 
-    loss_fn = FlowMatchingWithProjectionLoss(
+    loss_fn = IndependentFlowMatchingWithProjectionLoss(
         encoders=encoders,
         accelerator=accelerator,
     )
 
     if accelerator.is_main_process:
-        logger.info(f"SiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
+        logger.info(f"Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     if args.allow_tf32:
@@ -339,6 +355,10 @@ def main(args):
         optimizer.load_state_dict(ckpt['opt'])
         global_step = ckpt['steps']
 
+    prototypes = load_prototypes(args.prototype_path, device)
+    model.label_embedder.weight.data = prototypes
+
+
     model, optimizer, train_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader
     )
@@ -387,10 +407,10 @@ def main(args):
                     model.module.use_encoder_features = True if hasattr(model, 'module') \
                                                         else model.use_encoder_features
                 
-                flow_loss, proj_loss = loss_fn(model, x1, model_kwargs, zs=zs)
+                flow_loss, proj_loss, loss_y = loss_fn(model, x1, y, device, model_kwargs, zs=zs)
                 
                 # Total loss
-                loss = flow_loss + args.proj_coeff * proj_loss
+                loss = flow_loss + args.proj_coeff * proj_loss + args.y_coeff * loss_y
                 
                 # Optimization
                 accelerator.backward(loss)
@@ -403,6 +423,18 @@ def main(args):
                 
                 if accelerator.sync_gradients:
                     update_ema(ema, model)
+                
+            with torch.no_grad():         
+                all_labels = torch.arange(args.num_classes, device=device)
+                all_embeddings = model.module.label_embedder(all_labels)
+
+                distances = torch.cdist(vt_noise, all_embeddings)  # [B, num_classes]
+                predict_logits = -distances  # 거리 negative해서 가까울수록 큰 값
+
+                predicted_labels = torch.argmax(predict_logits, dim=1)
+                acc = (predicted_labels == y).float().mean().item()
+                
+                acc_list.append(acc)
             
             # Logging
             if accelerator.sync_gradients:
@@ -412,6 +444,7 @@ def main(args):
             logs = {
                 "loss": accelerator.gather(loss).mean().item(),
                 "flow_loss": accelerator.gather(flow_loss.mean()).mean().item(),
+                "loss_y": accelerator.gather(loss_y.mean()).mean().item(),
             }
             if proj_loss != 0:
                 logs["proj_loss"] = accelerator.gather(proj_loss).mean().item()
@@ -535,6 +568,7 @@ def parse_args(input_args=None):
     parser.add_argument("--cfg-prob", type=float, default=0.1)
     parser.add_argument("--enc-type", type=str, default='dinov2-vit-b')
     parser.add_argument("--proj-coeff", type=float, default=0.5)
+    parser.add_argument("--y-coeff", type=float, default=0.01)
     parser.add_argument("--weighting", default="uniform", type=str, help="Max gradient norm.")
     parser.add_argument("--legacy", action=argparse.BooleanOptionalAction, default=False)
 
@@ -545,6 +579,8 @@ def parse_args(input_args=None):
 
     parser.add_argument("--num-sampling-steps", type=int, default=100,
                        help="number of steps for ODE integration")
+
+    parser.add_argument("--prototype_path", type=str, default="./prototypes/dinov2_cifar10_prototypes.pt",)
 
 
     if input_args is not None:
