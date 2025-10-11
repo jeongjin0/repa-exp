@@ -373,10 +373,10 @@ def main(args):
             if args.use_encoder and args.proj_coeff > 0:
                 with torch.no_grad():
                     x1_preprocessed = preprocess_for_encoder(x1, args.encoder_type)
-                    z = encoder[0].forward_features(x1_preprocessed)
+                    z = encoder.forward_features(x1_preprocessed)
                     # DINOv2: remove CLS token
                     if args.encoder_type == 'dinov2':
-                        z = z[:, 1:]  # (B, 256, 384) for ViT-S
+                        z = z['x_norm_patchtokens']
                     zs = [z]
             
             with accelerator.accumulate(model):
