@@ -98,7 +98,7 @@ class FlowMatchingWithProjectionLoss:
         self.encoders = encoders
         self.accelerator = accelerator
     
-    def __call__(self, model, x1, device, model_kwargs=None, zs=None):
+    def __call__(self, model, x1, model_kwargs=None, zs=None):
         """
         Flow Matching loss with projection loss
         
@@ -128,11 +128,19 @@ class FlowMatchingWithProjectionLoss:
         y = torch.zeros(x1.size(0), dtype=torch.long, device=x1.device)
         
         if return_features:
-            model_output, zs_tilde = model(xt, t, y=y, return_features=True)
+            model_result = model(xt, t, y=y, return_features=True)
+            print(2222222)
+            # Dict로 반환되었는지 확인
+            if isinstance(model_result, dict):
+                model_output = model_result['output']
+                zs_tilde = model_result['features']
+            else:
+                # Fallback (단일 GPU에서는 tuple로 올 수 있음)
+                model_output, zs_tilde = model_result
         else:
             model_output = model(xt, t, y=y, return_features=False)
             zs_tilde = None
-        
+
         flow_loss = mean_flat((model_output - ut) ** 2)
         flow_loss = flow_loss.mean()
 

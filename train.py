@@ -132,17 +132,6 @@ def preprocess_for_encoder(x, encoder_type='dinov2'):
     
     return x
 
-def load_encoder(encoder_type='dinov2', device='cuda'):
-    if encoder_type == 'dinov2':
-        encoder = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
-        encoder = encoder.to(device)
-        encoder.eval()
-        requires_grad(encoder, False)
-    else:
-        raise NotImplementedError(f"Encoder {encoder_type} not implemented")
-    
-    return encoder
-
 @torch.no_grad()
 def generate_samples_euler(model, parallel, savedir, step, device, num_steps=100, net_="normal"):
     """
@@ -182,6 +171,10 @@ def generate_samples_euler(model, parallel, savedir, step, device, num_steps=100
 #################################################################################
 
 def main(args):    
+    if 'LOCAL_RANK' in os.environ:
+        local_rank = int(os.environ['LOCAL_RANK'])
+        torch.cuda.set_device(local_rank)
+
     # set accelerator
     logging_dir = Path(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(
@@ -224,11 +217,18 @@ def main(args):
     #z_dims = [encoder.embed_dim for encoder in encoders] if args.enc_type != 'None' else [0]
     block_kwargs = {"fused_attn": args.fused_attn, "qk_norm": args.qk_norm}
 
+    encoder = None
     if args.use_encoder:
-        encoder = load_encoder(args.encoder_type, device)
+        encoder = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14', verbose=False)
+        encoder = encoder.to(device)
+        encoder.eval()
+        requires_grad(encoder, False)
         encoders = [encoder]
+        
+        accelerator.wait_for_everyone()
     else:
         encoders = []
+
 
     # model = SiT_models[args.model](
     #     input_size=latent_size,
@@ -244,10 +244,6 @@ def main(args):
         in_channels=3,
         learn_sigma=False,
     ).to(device)
-
-    model = model.to(device)
-    ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
-    requires_grad(ema, False)
     
     latents_scale = torch.tensor(
         [0.18215, 0.18215, 0.18215, 0.18215]
@@ -300,13 +296,13 @@ def main(args):
     #     drop_last=True
     # )
 
-
-    train_dataset = datasets.CIFAR10(root="../flowmatching-exp/data/cifar10", train=True, download=True,
-        transform=transforms.Compose([
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-                ]),)
+    with accelerator.main_process_first():
+        train_dataset = datasets.CIFAR10(root="../flowmatching-exp/data/cifar10", train=True, download=True,
+            transform=transforms.Compose([
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+                    ]),)
     local_batch_size = int(args.batch_size // accelerator.num_processes)
     train_dataloader = DataLoader(
         train_dataset,
@@ -322,9 +318,6 @@ def main(args):
         logger.info(f"Dataset contains {len(train_dataset):,} images ({args.data_dir})")
     
     # Prepare models for training:
-    update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
-    model.train()  # important! This enables embedding dropout for classifier-free guidance
-    ema.eval()  # EMA model should always be in eval mode
     
     # resume:
     global_step = 0
@@ -343,6 +336,16 @@ def main(args):
         model, optimizer, train_dataloader
     )
 
+    model = model.to(device)
+    ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
+    requires_grad(ema, False)
+
+    update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
+    model.train()  # important! This enables embedding dropout for classifier-free guidance
+    ema.eval()  # EMA model should always be in eval mode
+
+    logger.info("Models, optimizers, and dataloaders prepared.")
+
     if accelerator.is_main_process:
         tracker_config = vars(copy.deepcopy(args))
         accelerator.init_trackers(
@@ -352,6 +355,8 @@ def main(args):
                 "wandb": {"name": f"{args.exp_name}"}
             },
         )
+    
+    logger.info("Starting training!")
         
     progress_bar = tqdm(
         range(0, args.max_train_steps),

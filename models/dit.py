@@ -38,7 +38,7 @@ class TimestepEmbedder(nn.Module):
         self.frequency_embedding_size = frequency_embedding_size
 
     @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
+    def timestep_embedding(t, dim, max_period=10):
         """
         Create sinusoidal timestep embeddings.
         :param t: a 1-D Tensor of N indices, one per batch element.
@@ -59,6 +59,21 @@ class TimestepEmbedder(nn.Module):
         return embedding
 
     def forward(self, t):
+
+        print(f"[TimestepEmbedder] Input t: shape={t.shape}, dtype={t.dtype}, device={t.device}")
+        print(f"[TimestepEmbedder] self.frequency_embedding_size={self.frequency_embedding_size}")
+        print(f"[TimestepEmbedder] Before timestep_embedding")
+        
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        
+        print(f"[TimestepEmbedder] After timestep_embedding, t_freq.shape={t_freq.shape}")
+        print(f"[TimestepEmbedder] Before mlp")
+        print(f"[TimestepEmbedder] mlp device: {next(self.mlp.parameters()).device}")
+        
+        t_emb = self.mlp(t_freq)
+        
+        print(f"[TimestepEmbedder] After mlp, t_emb.shape={t_emb.shape}")
+
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         t_emb = self.mlp(t_freq)
         return t_emb
@@ -242,20 +257,26 @@ class DiT(nn.Module):
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
+
+
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
         features = []
+
         for i, block in enumerate(self.blocks):
             x = block(x, c)
+
             if return_features and i in self.encoder_depths:
                 features.append(x.clone())
+
         x = self.final_layer(x, c)
         x = self.unpatchify(x)
+
     
-        if return_features:
-            return x, features
+        if return_features and len(features) > 0:
+            return {'output': x, 'features': features}
         return x
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
