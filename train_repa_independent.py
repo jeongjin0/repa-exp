@@ -317,7 +317,7 @@ def main(args):
     # )
 
 
-    train_dataset = datasets.CIFAR10(root="../flowmatching-exp/data/cifar10", train=True, download=True,
+    train_dataset = datasets.CIFAR10(root="./data/cifar10", train=True, download=True,
         transform=transforms.Compose([
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),

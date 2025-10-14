@@ -222,7 +222,7 @@ def main(args):
     # Setup data
     logger.info("Loading CIFAR10 dataset...")
     train_dataset = datasets.CIFAR10(
-        root="../flowmatching-exp/data/cifar10",
+        root="./data/cifar10",
         train=True,
         download=True,
         transform=transforms.Compose([
