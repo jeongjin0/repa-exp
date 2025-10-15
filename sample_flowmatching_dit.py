@@ -52,7 +52,7 @@ def generate_images(model, num_samples=64, save_folder="folder2", device="cuda",
 if __name__ == "__main__":
     device = "cuda:0"
 
-    weight_list = [f'exps/flowmatching_repa_real/checkpoints/0{a}0000.pt' for a in ['04', '08']]
+    weight_list = [f'exps/flowmatching_repa_real_timestepmodified/checkpoints/0{a}0000.pt' for a in ['04', '06']]
 
     for weight_path in weight_list:
         print(f"Loading weights from: {weight_path}")

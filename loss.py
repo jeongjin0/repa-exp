@@ -129,7 +129,6 @@ class FlowMatchingWithProjectionLoss:
         
         if return_features:
             model_result = model(xt, t, y=y, return_features=True)
-            print(2222222)
             # Dict로 반환되었는지 확인
             if isinstance(model_result, dict):
                 model_output = model_result['output']
