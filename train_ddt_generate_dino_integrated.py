@@ -19,8 +19,8 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 
-from models.dit import DiT_models
-from models.dit_repa_independent import DiTZeroflowintegrated_independent_t, DiTZeroflowintegrated_independent_multitoken
+from models.DDT import DiTwDDTHead
+from models.independent_ddt import DiTZeroflowintegrated_dino_generation
 from loss import SILoss, IndependentFlowMatchingWithProjectionLossdino
 from utils import load_encoders
 
@@ -271,17 +271,29 @@ def main(args):
     #     encoder_depth=args.encoder_depth,
     #     **block_kwargs
     # )
-    original_model = DiT_models['DiT-S/2'](
+    # Build original backbone and wrapped flow model
+    original_model = DiTwDDTHead(
         input_size=32,
-        num_classes=10,
+        patch_size=1,
         in_channels=3,
-        learn_sigma=False,
+        hidden_size=[384, 2048],
+        depth=[12, 2],
+        num_heads=[6, 16],
+        mlp_ratio=4.0,
+        class_dropout_prob=0.1,
+        num_classes=10,
+        use_qknorm=False,
+        use_swiglu=True,
+        use_rope=False,
+        use_rmsnorm=True,
+        wo_shift=False,
+        use_pos_embed=True,
     ).to(device)
-    #model = DiTZeroflowintegrated_independent_t(original_model, noise_dim=384, output_noise_dim=384).to(device)
-    noise_dim = 768
-    model = DiTZeroflowintegrated_independent_multitoken(original_model, noise_dim=noise_dim, output_noise_dim=noise_dim).to(device)
+    noise_dim = 384
 
+    model = DiTZeroflowintegrated_dino_generation(original_model, noise_dim=noise_dim, output_noise_dim=noise_dim).to(device)
     model = model.to(device)
+
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
     
@@ -346,7 +358,7 @@ def main(args):
 
     train_dataset = CIFAR10WithEmbeddings(
         cifar_base, 
-        embedding_path="./embeddings/dinov2_vitb_cifar10_train.pt"
+        embedding_path="./embeddings/dinov2_vits_cifar10_train.pt"
     )
 
     local_batch_size = int(args.batch_size // accelerator.num_processes)

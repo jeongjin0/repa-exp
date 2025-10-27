@@ -9,12 +9,12 @@ import torch.nn.functional as F
 from torchvision import datasets, transforms
 from tqdm import tqdm
 
-def compute_all_dinov2_embeddings(dataset, device, output_path):
+def compute_all_dinov2_embeddings(dataset, device, output_path, model_name='dinov2_vits14'):
     """
     모든 CIFAR10 이미지의 DINOv2 embedding 계산
     """
     print("Loading DINOv2 model...")
-    dinov2_model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
+    dinov2_model = torch.hub.load('facebookresearch/dinov2', model_name)
     dinov2_model = dinov2_model.to(device)
     dinov2_model.eval()
     
@@ -83,5 +83,6 @@ if __name__ == "__main__":
     compute_all_dinov2_embeddings(
         train_dataset, 
         device, 
-        "./embeddings/dinov2_cifar10_train.pt"
+        "./embeddings/dinov2_vits_cifar10_train.pt",
+        'dinov2_vits14'
     )
