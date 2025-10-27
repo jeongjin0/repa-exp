@@ -1,10 +1,13 @@
 import os
 import torch
 from torchvision import datasets, transforms
+from torchvision.models import resnet18
 from models.dit import DiT_models
 from models.dit_repa_independent import DiTZeroflowintegrated_independent_t
 from tqdm import tqdm
 import torch.nn.functional as F
+import torch.nn as nn
+import torch.optim as optim
 
 
 def compute_dinov2_embeddings(images, dinov2_model, device):
@@ -43,16 +46,126 @@ def add_noise_at_t(clean_image, noise, t):
     return t * noise + (1 - t) * clean_image
 
 
-def one_step_dino_prediction(model, dinov2_model, dataset, t1=0.9, t2=0.0,
-                             num_samples=10000, batch_size=32, device="cuda"):
+class DinoClassifier(nn.Module):
+    """
+    DINO embedding (384차원)을 입력받아 클래스를 예측하는 ResNet18 기반 classifier
+    """
+    def __init__(self, input_dim=384, num_classes=10):
+        super().__init__()
+        # ResNet18의 앞부분만 사용하거나, 간단한 MLP 사용
+        # 여기서는 MLP로 구현
+        self.classifier = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes)
+        )
+    
+    def forward(self, x):
+        return self.classifier(x)
+
+
+def train_dino_classifier(predicted_dinos, labels, num_epochs=50, batch_size=128, 
+                         learning_rate=0.001, device="cuda"):
+    """
+    Predicted DINO embedding으로부터 label을 예측하는 classifier 학습
+    
+    Args:
+        predicted_dinos: [N, 384] predicted DINO embeddings
+        labels: [N] 실제 클래스 레이블
+        num_epochs: 학습 에포크 수
+        batch_size: 배치 크기
+        learning_rate: 학습률
+        device: 디바이스
+    
+    Returns:
+        classifier: 학습된 classifier
+        train_acc: 최종 train accuracy
+    """
+    num_samples = predicted_dinos.shape[0]
+    dataset = torch.utils.data.TensorDataset(predicted_dinos, labels)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
+    # Classifier 생성
+    classifier = DinoClassifier(input_dim=384, num_classes=10).to(device)
+    optimizer = optim.Adam(classifier.parameters(), lr=learning_rate)
+    criterion = nn.CrossEntropyLoss()
+    
+    print(f"\n{'='*60}")
+    print(f"Training DINO Classifier")
+    print(f"Dataset size: {num_samples}")
+    print(f"Num epochs: {num_epochs}")
+    print(f"Batch size: {batch_size}")
+    print(f"Learning rate: {learning_rate}")
+    print(f"{'='*60}\n")
+    
+    classifier.train()
+    for epoch in range(num_epochs):
+        total_loss = 0
+        correct = 0
+        total = 0
+        
+        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
+        for batch_dinos, batch_labels in progress_bar:
+            batch_dinos = batch_dinos.to(device)
+            batch_labels = batch_labels.to(device)
+            
+            optimizer.zero_grad()
+            outputs = classifier(batch_dinos)
+            loss = criterion(outputs, batch_labels)
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += batch_labels.size(0)
+            correct += predicted.eq(batch_labels).sum().item()
+            
+            progress_bar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'acc': f'{100.*correct/total:.2f}%'
+            })
+        
+        epoch_loss = total_loss / len(dataloader)
+        epoch_acc = 100. * correct / total
+        print(f"Epoch {epoch+1}/{num_epochs} - Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.2f}%")
+    
+    # 최종 accuracy 계산
+    classifier.eval()
+    with torch.no_grad():
+        all_outputs = []
+        for batch_dinos, _ in torch.utils.data.DataLoader(dataset, batch_size=batch_size):
+            batch_dinos = batch_dinos.to(device)
+            outputs = classifier(batch_dinos)
+            all_outputs.append(outputs.cpu())
+        
+        all_outputs = torch.cat(all_outputs, dim=0)
+        _, predicted = all_outputs.max(1)
+        train_acc = 100. * predicted.eq(labels.cpu()).sum().item() / num_samples
+    
+    print(f"\nFinal Training Accuracy: {train_acc:.2f}%\n")
+    
+    return classifier, train_acc
+
+
+def one_step_dino_prediction_with_classifier(model, dinov2_model, dataset, t1=0.9, t2=0.0,
+                                             num_samples=10000, batch_size=32, device="cuda"):
     """
     t1=0.9, t2=0.0에서 one-step으로 DINO embedding 예측
     predicted_dino = noise_y + model_output_y
+    
+    그리고 predicted DINO로부터 클래스를 예측하는 classifier를 학습
     """
     noise_dim_size = 384
     
     total_batches = (num_samples + batch_size - 1) // batch_size
     all_mse_errors = []
+    all_predicted_dinos = []
+    all_actual_dinos = []
+    all_labels = []
     
     for b in tqdm(range(total_batches), desc=f"One-step DINO prediction (t1={t1}, t2={t2})"):
         current_batch_size = min(batch_size, num_samples - b * batch_size)
@@ -60,10 +173,13 @@ def one_step_dino_prediction(model, dinov2_model, dataset, t1=0.9, t2=0.0,
         # 실제 CIFAR-10 이미지 샘플링
         indices = torch.randint(0, len(dataset), (current_batch_size,))
         clean_images = []
+        labels = []
         for idx in indices:
-            img, _ = dataset[idx]
+            img, label = dataset[idx]
             clean_images.append(img)
+            labels.append(label)
         clean_images = torch.stack(clean_images).to(device)
+        labels = torch.tensor(labels, device=device)
         
         # Noise 생성
         noise_x = torch.randn_like(clean_images, device=device)
@@ -93,6 +209,11 @@ def one_step_dino_prediction(model, dinov2_model, dataset, t1=0.9, t2=0.0,
         # MSE 계산
         mse = F.mse_loss(predicted_dino, actual_dino, reduction='none').mean(dim=1)
         all_mse_errors.append(mse.cpu())
+        
+        # 저장
+        all_predicted_dinos.append(predicted_dino.cpu())
+        all_actual_dinos.append(actual_dino.cpu())
+        all_labels.append(labels.cpu())
     
     # 통계 계산
     all_mse_errors = torch.cat(all_mse_errors, dim=0)
@@ -107,6 +228,36 @@ def one_step_dino_prediction(model, dinov2_model, dataset, t1=0.9, t2=0.0,
     print(f"Min MSE:  {min_mse:.6f}")
     print(f"Max MSE:  {max_mse:.6f}\n")
     
+    # Classifier 학습
+    all_predicted_dinos = torch.cat(all_predicted_dinos, dim=0)
+    all_actual_dinos = torch.cat(all_actual_dinos, dim=0)
+    all_labels = torch.cat(all_labels, dim=0)
+    
+    print(f"\n{'='*60}")
+    print("Training classifier on PREDICTED DINO embeddings")
+    print(f"{'='*60}")
+    classifier_pred, train_acc_pred = train_dino_classifier(
+        all_predicted_dinos, all_labels, 
+        num_epochs=50, batch_size=128, learning_rate=0.001, device=device
+    )
+    
+    # 비교를 위해 actual DINO embedding으로도 classifier 학습
+    print(f"\n{'='*60}")
+    print("Training classifier on ACTUAL DINO embeddings (baseline)")
+    print(f"{'='*60}")
+    classifier_actual, train_acc_actual = train_dino_classifier(
+        all_actual_dinos, all_labels, 
+        num_epochs=50, batch_size=128, learning_rate=0.001, device=device
+    )
+    
+    print(f"\n{'='*60}")
+    print("CLASSIFIER TRAINING RESULTS")
+    print(f"{'='*60}")
+    print(f"Predicted DINO → Accuracy: {train_acc_pred:.2f}%")
+    print(f"Actual DINO → Accuracy: {train_acc_actual:.2f}%")
+    print(f"Accuracy Gap: {train_acc_actual - train_acc_pred:.2f}%")
+    print(f"{'='*60}\n")
+    
     return {
         't1': t1,
         't2': t2,
@@ -114,7 +265,11 @@ def one_step_dino_prediction(model, dinov2_model, dataset, t1=0.9, t2=0.0,
         'std_mse': std_mse,
         'min_mse': min_mse,
         'max_mse': max_mse,
-        'all_mse': all_mse_errors
+        'all_mse': all_mse_errors,
+        'train_acc_predicted': train_acc_pred,
+        'train_acc_actual': train_acc_actual,
+        'classifier_pred': classifier_pred,
+        'classifier_actual': classifier_actual
     }
 
 
@@ -141,7 +296,8 @@ if __name__ == "__main__":
     dinov2_model.eval()
 
     # 160k checkpoint 실험
-    weight_path = 'exps/independent_dino/checkpoints/0160000.pt'
+    weight_path = 'exps2/independent_dino/checkpoints/0160000.pt'
+    weight_path = 'exps2/exps/independent_dino/checkpoints/0160000.pt'
     
     print(f"\n{'='*60}")
     print(f"Loading weights from: {weight_path}")
@@ -167,8 +323,8 @@ if __name__ == "__main__":
     model.load_state_dict(new_state_dict)
     model.eval()
 
-    # One-step prediction: t1=0.9, t2=0.0
-    results = one_step_dino_prediction(
+    # One-step prediction with classifier training
+    results = one_step_dino_prediction_with_classifier(
         model=model,
         dinov2_model=dinov2_model,
         dataset=dataset,
@@ -178,7 +334,3 @@ if __name__ == "__main__":
         batch_size=32,
         device=device
     )
-
-    # Save results
-    torch.save(results, 'onestep_dino_mse_t1_0.9_t2_0.0_160k.pt')
-    print(f"\nResults saved to 'onestep_dino_mse_t1_0.9_t2_0.0_160k.pt'")

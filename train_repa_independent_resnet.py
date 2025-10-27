@@ -384,10 +384,10 @@ def main(args):
             f'{os.path.join(args.output_dir, args.exp_name)}/checkpoints/{ckpt_name}',
             map_location='cpu',
             )
-        model.load_state_dict(ckpt['model'])
-        ema.load_state_dict(ckpt['ema'])
-        optimizer.load_state_dict(ckpt['opt'])
-        global_step = ckpt['steps']
+        model.load_state_dict(ckpt['net_model'])
+        ema.load_state_dict(ckpt['ema_model'])
+        optimizer.load_state_dict(ckpt['optim'])
+        global_step = ckpt['step']
 
     if args.load_path is not None:
         print(f"Loading model from {args.load_path}...")
